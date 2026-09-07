@@ -9,8 +9,7 @@ The script detects workers in a video, checks whether they're wearing a helmet a
 ## ✨ Features
 
 - 🎥 **Video processing** — reads any `.mp4` input and writes a fully annotated output video at the same resolution and frame rate.
-- 🧠 **YOLOv8 object detection** — detects `person`, `helmet`, and `safety-vest` (swap in your own custom-trained weights for real PPE detection).
-- 🟥 **Danger zone overlay** — a translucent red polygon marks a hazardous area on the frame.
+- 🧠 **safety_gear.pt** — detects `person`, `helmet`, and `safety-vest` (swap in your own custom-trained weights for real PPE detection).
 - 🚨 **Real-time violation alerts** — a flashing on-screen banner ("DANGER ZONE VIOLATION!") triggers the instant a worker's bounding box overlaps the danger zone.
 - 🟢🔴 **PPE compliance boxes** — green boxes for workers with helmet + vest detected, red boxes for workers missing gear.
 - 🖥️ **Live preview + file export** — watch the analysis happen in a window while it simultaneously saves to disk.
