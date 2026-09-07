@@ -1,500 +1,743 @@
+"""
+=============================================================================
+ CONSTRUCTION WORKER SAFETY MONITOR
+=============================================================================
+ What this script does:
+   1. Opens a construction-site video.
+   2. Runs a YOLOv8 model on every frame to find people, helmets,
+      and safety vests.
+   3. Checks whether each detected person appears to have a helmet
+      and safety vest.
+   4. Workers WITH both helmet and vest get a GREEN box.
+   5. Workers MISSING helmet or vest get a RED box.
+   6. The detected helmet and safety-vest boxes are also displayed.
+   7. Shows the processed video live.
+   8. Saves the processed video to:
+         videos/output_video.mp4
+
+ REQUIRED PACKAGES:
+     pip install ultralytics opencv-python numpy
+
+ IMPORTANT NOTE ABOUT THE MODEL:
+   The standard 'yolov8n.pt' model is trained on the COCO dataset.
+   COCO contains the "person" class, but it does NOT contain
+   "helmet" or "safety-vest".
+
+   Therefore, for real helmet/vest detection, you need a custom
+   YOLO model trained on construction safety data.
+
+   For example:
+       model = YOLO("safety_gear.pt")
+
+   Your custom model should contain classes similar to:
+       person
+       helmet
+       safety-vest
+
+   The class-matching code below is flexible and can also recognize
+   names such as:
+       Helmet
+       hard-hat
+       safety helmet
+       vest
+       safety vest
+=============================================================================
+"""
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 
-# ============================================================
-# 1. LOAD MODEL
-# ============================================================
+# =============================================================================
+# SECTION 1: CONFIGURATION
+# =============================================================================
 
+# --- Video files ---
+
+INPUT_VIDEO_PATH = "videos/input_video.mp4"
+
+OUTPUT_VIDEO_PATH = "videos/output_video.mp4"
+
+
+# --- YOLO model ---
+
+# Use your custom safety-gear model here.
+#
 # IMPORTANT:
+# "yolov8n.pt" can detect people but NOT helmets or safety vests.
 #
-# yolov8n.pt is the normal COCO model.
-# It can detect PERSON, but it cannot detect HELMET
-# or SAFETY-VEST.
+# If your custom model is called safety_gear.pt:
 #
-# If you have a custom construction safety model, use:
+#     MODEL_PATH = "safety_gear.pt"
 #
-# model = YOLO("safety_gear.pt")
+MODEL_PATH = "safety_gear.pt"
+
+
+# Minimum confidence required for a detection.
 #
-# The custom model should contain:
-#   person
-#   helmet
-#   safety-vest
+# 0.4 means that YOLO will ignore detections with less than
+# 40% confidence.
 #
-model = YOLO("safety_gear.pt")
+# You can try:
+#
+# 0.30 = more detections
+# 0.40 = balanced
+# 0.50 = stricter
+#
+CONFIDENCE_THRESHOLD = 0.4
 
 
-# ============================================================
-# 2. VIDEO SETTINGS
-# ============================================================
+# =============================================================================
+# SECTION 2: COLORS
+# =============================================================================
 
-input_video = "videos/input_video.mp4"
-output_video = "videos/output_video.mp4"
+# OpenCV uses BGR colors instead of RGB.
 
+COLOR_RED = (0, 0, 255)
 
-# Open video
-cap = cv2.VideoCapture(input_video)
+COLOR_GREEN = (0, 255, 0)
 
-
-if not cap.isOpened():
-    print("ERROR: Could not open video.")
-    exit()
+COLOR_WHITE = (255, 255, 255)
 
 
-# Get video information
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
+# =============================================================================
+# SECTION 3: HELPER FUNCTIONS
+# =============================================================================
+
+def boxes_overlap(box_a, box_b):
+    """
+    Checks whether two rectangular bounding boxes overlap.
+
+    box format:
+        (x1, y1, x2, y2)
+
+    Returns:
+        True  -> boxes overlap
+        False -> boxes do not overlap
+    """
+
+    ax1, ay1, ax2, ay2 = box_a
+
+    bx1, by1, bx2, by2 = box_b
 
 
-print("Video width :", width)
-print("Video height:", height)
-print("Video FPS   :", fps)
+    # Check if box A is completely to the left/right of box B.
+    if ax2 < bx1 or bx2 < ax1:
+        return False
 
 
-# ============================================================
-# 3. CREATE OUTPUT VIDEO
-# ============================================================
+    # Check if box A is completely above/below box B.
+    if ay2 < by1 or by2 < ay1:
+        return False
 
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-out = cv2.VideoWriter(
-    output_video,
-    fourcc,
-    fps,
-    (width, height)
+    # Otherwise, the boxes overlap.
+    return True
+
+
+def match_class_name(model_class_names, keyword):
+    """
+    Searches through the model's class names.
+
+    For example, if the model contains:
+
+        0: person
+        1: helmet
+        2: safety-vest
+
+    Then:
+
+        match_class_name(model.names, "helmet")
+
+    will find:
+
+        ["helmet"]
+
+    Matching is case-insensitive.
+    """
+
+    matches = []
+
+
+    for class_id, class_name in model_class_names.items():
+
+        if keyword.lower() in class_name.lower():
+
+            matches.append(class_name)
+
+
+    return matches
+
+
+# =============================================================================
+# SECTION 4: LOAD YOLO MODEL
+# =============================================================================
+
+print("Loading YOLO model...")
+
+model = YOLO(MODEL_PATH)
+
+
+# Get the class names from the model.
+#
+# Example:
+#
+# {
+#     0: "person",
+#     1: "helmet",
+#     2: "safety-vest"
+# }
+#
+person_class_names = match_class_name(
+    model.names,
+    "person"
+)
+
+helmet_class_names = match_class_name(
+    model.names,
+    "helmet"
+)
+
+vest_class_names = match_class_name(
+    model.names,
+    "vest"
 )
 
 
-# ============================================================
-# 4. DANGER ZONE
-# ============================================================
+print()
+print("Model classes:")
+print(model.names)
 
-# IMPORTANT:
-#
-# These coordinates are only an example.
-#
-# You MUST adjust them according to your camera.
-#
-# For a 1920x1080 video, for example:
-#
-danger_zone = np.array([
-    [700, 300],
-    [1250, 300],
-    [1500, 900],
-    [450, 900]
-], np.int32)
+print()
+print("Detected class groups:")
+print("Person :", person_class_names)
+print("Helmet :", helmet_class_names)
+print("Vest   :", vest_class_names)
+print()
 
 
-# ============================================================
-# 5. PROCESS VIDEO
-# ============================================================
+# Warn the user if the model doesn't contain helmet/vest classes.
+if not helmet_class_names or not vest_class_names:
+
+    print("============================================================")
+    print("WARNING:")
+    print("This model does not contain helmet and/or vest classes.")
+    print()
+    print("The standard yolov8n.pt model cannot detect helmets")
+    print("or safety vests.")
+    print()
+    print("Use a custom safety-gear trained model such as:")
+    print("    safety_gear.pt")
+    print("============================================================")
+    print()
+
+
+# =============================================================================
+# SECTION 5: OPEN INPUT VIDEO
+# =============================================================================
+
+print("Opening video...")
+
+video_capture = cv2.VideoCapture(
+    INPUT_VIDEO_PATH
+)
+
+
+# Make sure the video opened correctly.
+if not video_capture.isOpened():
+
+    raise IOError(
+        f"Could not open video file: {INPUT_VIDEO_PATH}"
+    )
+
+
+# Get video dimensions.
+frame_width = int(
+    video_capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+)
+
+frame_height = int(
+    video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+)
+
+
+# Get video FPS.
+frames_per_second = video_capture.get(
+    cv2.CAP_PROP_FPS
+)
+
+
+# Sometimes a video doesn't contain valid FPS information.
+# Use 30 FPS as a fallback.
+if frames_per_second <= 0:
+
+    frames_per_second = 30.0
+
+
+print(
+    f"Input video: "
+    f"{frame_width}x{frame_height} "
+    f"@ {frames_per_second:.2f} FPS"
+)
+
+
+# =============================================================================
+# SECTION 6: CREATE OUTPUT VIDEO
+# =============================================================================
+
+# MP4 video codec.
+fourcc = cv2.VideoWriter_fourcc(
+    *"mp4v"
+)
+
+
+# Create the output video writer.
+#
+# We use:
+# - same width
+# - same height
+# - same FPS
+#
+video_writer = cv2.VideoWriter(
+
+    OUTPUT_VIDEO_PATH,
+
+    fourcc,
+
+    frames_per_second,
+
+    (frame_width, frame_height)
+)
+
+
+# =============================================================================
+# SECTION 7: MAIN VIDEO LOOP
+# =============================================================================
+
+print()
+print("Starting video processing...")
+print("Press 'q' to stop.")
+print()
+
+
+frame_count = 0
+
 
 while True:
 
-    success, frame = cap.read()
+    # ---------------------------------------------------------
+    # Read one frame from the video.
+    # ---------------------------------------------------------
 
+    success, frame = video_capture.read()
+
+
+    # If there are no more frames, stop.
     if not success:
+
         break
 
 
-    # ========================================================
-    # RUN YOLO
-    # ========================================================
+    frame_count += 1
+
+
+    # ---------------------------------------------------------
+    # Run YOLO detection.
+    # ---------------------------------------------------------
 
     results = model(
+
         frame,
-        conf=0.40,
+
+        conf=CONFIDENCE_THRESHOLD,
+
         verbose=False
-    )
+
+    )[0]
 
 
-    # ========================================================
-    # DRAW TRANSPARENT DANGER ZONE
-    # ========================================================
+    # ---------------------------------------------------------
+    # Create lists for our three object types.
+    # ---------------------------------------------------------
 
-    overlay = frame.copy()
+    person_boxes = []
 
-    cv2.fillPoly(
-        overlay,
-        [danger_zone],
-        (0, 0, 255)
-    )
+    helmet_boxes = []
 
-    # Make the red zone transparent
-    frame = cv2.addWeighted(
-        overlay,
-        0.20,
-        frame,
-        0.80,
-        0
-    )
+    vest_boxes = []
 
 
-    # Draw only the OUTLINE of the danger zone
-    cv2.polylines(
-        frame,
-        [danger_zone],
-        True,
-        (0, 0, 255),
-        3
-    )
+    # ---------------------------------------------------------
+    # Read all YOLO detections.
+    # ---------------------------------------------------------
+
+    for detected_box in results.boxes:
 
 
-    # ========================================================
-    # STORE DETECTED OBJECTS
-    # ========================================================
-
-    persons = []
-    helmets = []
-    vests = []
-
-
-    # ========================================================
-    # READ YOLO DETECTIONS
-    # ========================================================
-
-    for result in results:
-
-        for box in result.boxes:
-
-            class_id = int(box.cls[0])
-            confidence = float(box.conf[0])
-
-            x1, y1, x2, y2 = map(
-                int,
-                box.xyxy[0]
-            )
-
-            class_name = model.names[class_id]
-
-
-            # ------------------------------------------------
-            # PERSON
-            # ------------------------------------------------
-
-            if class_name == "person":
-
-                persons.append({
-                    "box": (x1, y1, x2, y2),
-                    "confidence": confidence
-                })
-
-
-            # ------------------------------------------------
-            # HELMET
-            # ------------------------------------------------
-
-            elif class_name == "helmet":
-
-                helmets.append({
-                    "box": (x1, y1, x2, y2),
-                    "confidence": confidence
-                })
-
-
-            # ------------------------------------------------
-            # SAFETY VEST
-            # ------------------------------------------------
-
-            elif class_name in ["safety-vest", "vest"]:
-
-                vests.append({
-                    "box": (x1, y1, x2, y2),
-                    "confidence": confidence
-                })
-
-
-    # ========================================================
-    # CHECK EACH PERSON
-    # ========================================================
-
-    danger_violation = False
-
-
-    for person in persons:
-
-        x1, y1, x2, y2 = person["box"]
-
-
-        # ====================================================
-        # CHECK DANGER ZONE
-        # ====================================================
-
-        # Use the person's CENTER point.
-        #
-        # This prevents random detections around the person
-        # from triggering the danger zone.
-
-        center_x = int((x1 + x2) / 2)
-        center_y = int((y1 + y2) / 2)
-
-
-        inside_zone = cv2.pointPolygonTest(
-            danger_zone,
-            (center_x, center_y),
-            False
+        # Get class ID.
+        class_id = int(
+            detected_box.cls[0]
         )
 
 
-        if inside_zone >= 0:
-            danger_violation = True
+        # Get class name.
+        class_name = model.names[class_id]
 
 
-        # ====================================================
+        # Get bounding-box coordinates.
+        x1, y1, x2, y2 = map(
+            int,
+            detected_box.xyxy[0]
+        )
+
+
+        # Store the bounding box.
+        box_coords = (
+            x1,
+            y1,
+            x2,
+            y2
+        )
+
+
+        # -----------------------------------------------------
+        # PERSON
+        # -----------------------------------------------------
+
+        if class_name in person_class_names:
+
+            person_boxes.append(
+                box_coords
+            )
+
+
+        # -----------------------------------------------------
+        # HELMET
+        # -----------------------------------------------------
+
+        elif class_name in helmet_class_names:
+
+            helmet_boxes.append(
+                box_coords
+            )
+
+
+        # -----------------------------------------------------
+        # SAFETY VEST
+        # -----------------------------------------------------
+
+        elif class_name in vest_class_names:
+
+            vest_boxes.append(
+                box_coords
+            )
+
+
+    # =============================================================================
+    # SECTION 8: CHECK EVERY PERSON
+    # =============================================================================
+
+    for person_box in person_boxes:
+
+
+        x1, y1, x2, y2 = person_box
+
+
+        # -----------------------------------------------------
         # CHECK FOR HELMET
-        # ====================================================
+        # -----------------------------------------------------
 
-        wearing_helmet = False
-
-
-        for helmet in helmets:
-
-            hx1, hy1, hx2, hy2 = helmet["box"]
+        has_helmet = False
 
 
-            # Helmet center
-            helmet_center_x = int((hx1 + hx2) / 2)
-            helmet_center_y = int((hy1 + hy2) / 2)
+        for helmet_box in helmet_boxes:
 
 
-            # Check whether helmet is inside the upper
-            # portion of the person's bounding box.
-            #
-            # This helps associate the helmet with the
-            # correct person.
-
-            if (
-                x1 <= helmet_center_x <= x2
-                and
-                y1 <= helmet_center_y <= y1 + int((y2 - y1) * 0.45)
+            # Check whether the helmet overlaps the person.
+            if boxes_overlap(
+                person_box,
+                helmet_box
             ):
 
-                wearing_helmet = True
+                has_helmet = True
+
                 break
 
 
-        # ====================================================
+        # -----------------------------------------------------
         # CHECK FOR SAFETY VEST
-        # ====================================================
+        # -----------------------------------------------------
 
-        wearing_vest = False
-
-
-        for vest in vests:
-
-            vx1, vy1, vx2, vy2 = vest["box"]
+        has_vest = False
 
 
-            # Vest center
-            vest_center_x = int((vx1 + vx2) / 2)
-            vest_center_y = int((vy1 + vy2) / 2)
+        for vest_box in vest_boxes:
 
 
-            # Vest should be somewhere around the person's
-            # upper/middle body.
-
-            if (
-                x1 <= vest_center_x <= x2
-                and
-                y1 + int((y2 - y1) * 0.20)
-                <= vest_center_y
-                <=
-                y1 + int((y2 - y1) * 0.75)
+            # Check whether the vest overlaps the person.
+            if boxes_overlap(
+                person_box,
+                vest_box
             ):
 
-                wearing_vest = True
+                has_vest = True
+
                 break
 
 
-        # ====================================================
+        # -----------------------------------------------------
         # DETERMINE SAFETY STATUS
-        # ====================================================
+        # -----------------------------------------------------
 
-        if wearing_helmet and wearing_vest:
+        if has_helmet and has_vest:
 
-            # Green = everything is present
-            box_color = (0, 255, 0)
+            # Person has both required pieces of PPE.
+            box_color = COLOR_GREEN
 
-            status = "SAFE"
+            status_text = "SAFE"
+
 
         else:
 
-            # Red = something is missing
-            box_color = (0, 0, 255)
-
-            missing = []
-
-            if not wearing_helmet:
-                missing.append("HELMET")
-
-            if not wearing_vest:
-                missing.append("VEST")
-
-            status = "MISSING: " + ", ".join(missing)
+            # Something is missing.
+            box_color = COLOR_RED
 
 
-        # ====================================================
+            missing_items = []
+
+
+            if not has_helmet:
+
+                missing_items.append(
+                    "HELMET"
+                )
+
+
+            if not has_vest:
+
+                missing_items.append(
+                    "VEST"
+                )
+
+
+            status_text = (
+                "MISSING: "
+                + ", ".join(missing_items)
+            )
+
+
+        # -----------------------------------------------------
         # DRAW PERSON BOX
-        # ====================================================
+        # -----------------------------------------------------
 
         cv2.rectangle(
+
             frame,
+
             (x1, y1),
+
             (x2, y2),
+
             box_color,
+
             3
+
         )
 
 
-        # ====================================================
-        # DRAW STATUS
-        # ====================================================
+        # -----------------------------------------------------
+        # DRAW PERSON STATUS
+        # -----------------------------------------------------
 
         cv2.putText(
+
             frame,
-            status,
-            (x1, max(y1 - 10, 25)),
+
+            status_text,
+
+            (x1, max(y1 - 10, 20)),
+
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+
+            0.6,
+
             box_color,
-            2
+
+            2,
+
+            cv2.LINE_AA
+
         )
 
 
-    # ========================================================
-    # DRAW HELMET BOXES
-    # ========================================================
+    # =============================================================================
+    # SECTION 9: DRAW HELMET DETECTIONS
+    # =============================================================================
 
-    for helmet in helmets:
+    for helmet_box in helmet_boxes:
 
-        x1, y1, x2, y2 = helmet["box"]
+
+        x1, y1, x2, y2 = helmet_box
+
 
         cv2.rectangle(
+
             frame,
+
             (x1, y1),
+
             (x2, y2),
-            (0, 255, 0),
+
+            COLOR_GREEN,
+
             2
+
         )
 
+
         cv2.putText(
+
             frame,
+
             "HELMET",
+
             (x1, max(y1 - 5, 20)),
+
             cv2.FONT_HERSHEY_SIMPLEX,
+
             0.5,
-            (0, 255, 0),
-            2
+
+            COLOR_GREEN,
+
+            2,
+
+            cv2.LINE_AA
+
         )
 
 
-    # ========================================================
-    # DRAW VEST BOXES
-    # ========================================================
+    # =============================================================================
+    # SECTION 10: DRAW SAFETY VEST DETECTIONS
+    # =============================================================================
 
-    for vest in vests:
+    for vest_box in vest_boxes:
 
-        x1, y1, x2, y2 = vest["box"]
+
+        x1, y1, x2, y2 = vest_box
+
 
         cv2.rectangle(
+
             frame,
+
             (x1, y1),
+
             (x2, y2),
-            (0, 255, 0),
+
+            COLOR_GREEN,
+
             2
+
         )
 
+
         cv2.putText(
+
             frame,
+
             "SAFETY VEST",
+
             (x1, max(y1 - 5, 20)),
+
             cv2.FONT_HERSHEY_SIMPLEX,
+
             0.5,
-            (0, 255, 0),
-            2
+
+            COLOR_GREEN,
+
+            2,
+
+            cv2.LINE_AA
+
         )
 
 
-    # ========================================================
-    # DANGER ZONE ALERT
-    # ========================================================
+    # =============================================================================
+    # SECTION 11: INFORMATION DISPLAY
+    # =============================================================================
 
-    if danger_violation:
-
-        text = "DANGER ZONE VIOLATION!"
-
-        text_size = cv2.getTextSize(
-            text,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.2,
-            4
-        )[0]
+    info_text = (
+        f"Frame: {frame_count} | "
+        f"Workers: {len(person_boxes)}"
+    )
 
 
-        text_width = text_size[0]
+    cv2.putText(
+
+        frame,
+
+        info_text,
+
+        (10, frame_height - 15),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.5,
+
+        COLOR_WHITE,
+
+        1,
+
+        cv2.LINE_AA
+
+    )
 
 
-        # Center the warning
-        text_x = (width - text_width) // 2
+    # =============================================================================
+    # SECTION 12: SAVE FRAME
+    # =============================================================================
 
-
-        # Black background
-        cv2.rectangle(
-            frame,
-            (text_x - 20, 20),
-            (text_x + text_width + 20, 85),
-            (0, 0, 0),
-            -1
-        )
-
-
-        # Red warning
-        cv2.putText(
-            frame,
-            text,
-            (text_x, 68),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.2,
-            (0, 0, 255),
-            4
-        )
-
-
-    # ========================================================
-    # SHOW VIDEO
-    # ========================================================
-
-    cv2.imshow(
-        "Construction Worker Safety Monitor",
+    video_writer.write(
         frame
     )
 
 
-    # ========================================================
-    # SAVE VIDEO
-    # ========================================================
+    # =============================================================================
+    # SECTION 13: DISPLAY FRAME
+    # =============================================================================
 
-    out.write(frame)
+    cv2.imshow(
+
+        "Construction Worker Safety Monitor",
+
+        frame
+
+    )
 
 
-    # Press Q to quit
+    # Press Q to stop.
     if cv2.waitKey(1) & 0xFF == ord("q"):
+
+        print("Stopped by user.")
+
         break
 
 
-# ============================================================
-# CLEAN UP
-# ============================================================
+# =============================================================================
+# SECTION 14: CLEAN UP
+# =============================================================================
 
-cap.release()
-out.release()
+video_capture.release()
+
+video_writer.release()
+
 cv2.destroyAllWindows()
 
 
 print()
-print("======================================")
+print("============================================================")
 print("Processing finished!")
-print("Output:", output_video)
-print("======================================")
+print(f"Frames processed: {frame_count}")
+print(f"Output video: {OUTPUT_VIDEO_PATH}")
+print("============================================================")
